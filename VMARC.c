@@ -756,6 +756,18 @@ XADGETINFO(VMARC)
 
   while (ai->xai_InPos < ai->xai_InSize) {
     xadSize startpos;
+    xadUINT8 flags;
+    xadUINT8 recfm;
+    xadUINT32 lrecl;
+    xadSize data_start;
+    char fn[9], ft[9], fm[3], full_name[32];
+    int i, p;
+    xadUINT32 name_len;
+    struct xadFileInfo *fi;
+    xadINT32 year;
+    struct VMARCPrivFile *pf;
+    xadSize next_header_pos;
+    xadUINT8 scan_buf[38];
 
     if (!vmarc_find_header(ai, xadMasterBase, ai->xai_InPos, &startpos, buf)) {
       err = XADERR_ILLEGALDATA;
@@ -766,10 +778,9 @@ XADGETINFO(VMARC)
     memmove(buf, buf + 8, H_DLEN);
     ai->xai_InPos = startpos + 38;
 
-    xadUINT8 flags = buf[H_FLAGS];
-    xadUINT8 recfm = (xadUINT8)e2a_tab[buf[H_RECFM]];
-
-    xadUINT32 lrecl = ((xadUINT32)buf[H_LRECL] << 8) | buf[H_LRECL + 1];
+    flags = buf[H_FLAGS];
+    recfm = (xadUINT8)e2a_tab[buf[H_RECFM]];
+    lrecl = ((xadUINT32)buf[H_LRECL] << 8) | buf[H_LRECL + 1];
 
     /* Extended header: bytes 30..33 hold the full 32-bit LRECL. The
      * 2-byte field in the basic header is only a truncated copy. */
@@ -783,12 +794,9 @@ XADGETINFO(VMARC)
               ((xadUINT32)exth[2] << 8) | (xadUINT32)exth[3];
     }
 
-    xadSize data_start = ai->xai_InPos;
+    data_start = ai->xai_InPos;
 
     /* Build filename: UPPERCASE FN.FT.FM (e.g. "MYPROG.EXEC.A1") */
-    char fn[9], ft[9], fm[3];
-    int i, p;
-
     /* FN */
     p = 0;
     for (i = 0; i < 8; i++) {
@@ -816,11 +824,10 @@ XADGETINFO(VMARC)
     fm[p] = '\0';
     if (p == 0) strcpy(fm, "A1");
 
-    char full_name[32];
-    snprintf(full_name, sizeof(full_name), "%s.%s.%s", fn, ft, fm);
-    xadUINT32 name_len = (xadUINT32)strlen(full_name) + 1;
+    sprintf(full_name, "%s.%s.%s", fn, ft, fm);
+    name_len = (xadUINT32)strlen(full_name) + 1;
 
-    struct xadFileInfo *fi = (struct xadFileInfo *)xadAllocObject(
+    fi = (struct xadFileInfo *)xadAllocObject(
       XADM XADOBJ_FILEINFO,
       XAD_OBJNAMESIZE, name_len,
       XAD_OBJPRIVINFOSIZE, sizeof(struct VMARCPrivFile),
@@ -839,7 +846,7 @@ XADGETINFO(VMARC)
 
     /* Date and time decoding from BCD. Very old VMARC writers did not
      * set HF_Y2K, so a year below 1960 belongs to the 21st century. */
-    xadINT32 year = cvb(buf[H_YEAR]) + 1900;
+    year = cvb(buf[H_YEAR]) + 1900;
     if (flags & HF_Y2K) year += 100;
     if (year < 1960) year += 100;
     fi->xfi_Date.xd_Year   = year;
@@ -850,7 +857,7 @@ XADGETINFO(VMARC)
     fi->xfi_Date.xd_Second = cvb(buf[H_SECOND]);
     fi->xfi_Date.xd_Micros = 0;
 
-    struct VMARCPrivFile *pf = (struct VMARCPrivFile *)fi->xfi_PrivateInfo;
+    pf = (struct VMARCPrivFile *)fi->xfi_PrivateInfo;
     if (pf) {
       pf->vpf_Flags = flags;
       pf->vpf_Recfm = recfm;
@@ -860,8 +867,7 @@ XADGETINFO(VMARC)
 
     /* Find the next fully valid subfile header. Byte-wise scanning is used
      * so archives that were not reblocked to 80-column cards still work. */
-    xadSize next_header_pos = ai->xai_InSize;
-    xadUINT8 scan_buf[38];
+    next_header_pos = ai->xai_InSize;
     (void)vmarc_find_header(ai, xadMasterBase, data_start, &next_header_pos, scan_buf);
 
     fi->xfi_CrunchSize = (next_header_pos > data_start) ? (next_header_pos - data_start) : 0;
@@ -889,10 +895,14 @@ XADGETINFO(VMARC)
 XADUNARCHIVE(VMARC)
 {
   struct xadFileInfo *fi = ai->xai_CurFile;
+  struct VMARCPrivFile *pf;
+  struct VMARCState *s;
+  xadERROR err = XADERR_OK;
+
   if (!fi || !fi->xfi_PrivateInfo) return XADERR_BADPARAMS;
 
-  struct VMARCPrivFile *pf = (struct VMARCPrivFile *)fi->xfi_PrivateInfo;
-  struct VMARCState *s = (struct VMARCState *)xadAllocVec(XADM sizeof(struct VMARCState), XADMEMF_CLEAR);
+  pf = (struct VMARCPrivFile *)fi->xfi_PrivateInfo;
+  s = (struct VMARCState *)xadAllocVec(XADM sizeof(struct VMARCState), XADMEMF_CLEAR);
   if (!s) return XADERR_NOMEMORY;
 
   ai->xai_InPos = pf->vpf_DataPos;
@@ -904,8 +914,6 @@ XADUNARCHIVE(VMARC)
   s->is_text = 1; /* Text converted to ISO-8859-1 (Latin-1) */
   s->residual = 0xffffffff;
   s->limit = ai->xai_InSize;
-
-  xadERROR err = XADERR_OK;
 
   if (pf->vpf_Flags & HF_ASIS) {
     err = decompress_asis(s);

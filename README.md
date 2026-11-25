@@ -30,6 +30,9 @@ To compile and execute the test suite:
 make test
 ```
 
+### SAS/C and ANSI C
+The client code is ANSI C89-compatible. `SDI_compiler.h` handles SAS/C register calling conventions, and `xadmaster.h` uses native Amiga integer typedefs when `__SASC` and `AMIGA` are defined.
+
 ### Compiling with vbcc
 Requires an Amiga/68k-capable vbcc installation:
 ```sh
