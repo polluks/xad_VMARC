@@ -43,10 +43,18 @@
           XADBASE)
 #endif
 
-#define XADRECOGDATAP(name) (xadBOOL (*)()) name##_RecogData
-#define XADGETINFOP(name)   (xadERROR (*)()) name##_GetInfo
-#define XADUNARCHIVEP(name) (xadERROR (*)()) name##_UnArchive
-#define XADFREEP(name)      (void (*)()) name##_Free
+#if defined(AMIGA) && !defined(__MORPHOS__) && !defined(SDI_MORPHOSNOREG)
+  /* Classic 68k clients use untyped callback fields. */
+  #define XADRECOGDATAP(name) (xadBOOL (*)()) name##_RecogData
+  #define XADGETINFOP(name)   (xadERROR (*)()) name##_GetInfo
+  #define XADUNARCHIVEP(name) (xadERROR (*)()) name##_UnArchive
+  #define XADFREEP(name)      (void (*)()) name##_Free
+#else
+  #define XADRECOGDATAP(name) name##_RecogData
+  #define XADGETINFOP(name)   name##_GetInfo
+  #define XADUNARCHIVEP(name) name##_UnArchive
+  #define XADFREEP(name)      name##_Free
+#endif
 
 #ifdef XADMASTERFILE
   #define XADFIRSTCLIENT(name)  static const struct xadClient name##_Client =

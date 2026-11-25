@@ -110,7 +110,7 @@ typedef struct strdsect {
 struct VMARCPrivFile {
   xadUINT8  vpf_Flags;
   xadUINT8  vpf_Recfm;
-  xadUINT16 vpf_Lrecl;
+  xadUINT32 vpf_Lrecl;
   xadSize   vpf_DataPos;
 };
 
@@ -126,6 +126,9 @@ struct VMARCState {
   xadUINT32 ibufp;
   xadUINT32 icnt;
   xadSize   ipos;
+  xadSize   in_count;
+  xadSize   limit;
+  xadBOOL   input_error;
   xadUINT32 residual;
 
   xadUINT8  recfm;
@@ -136,6 +139,11 @@ struct VMARCState {
 
   xadUINT8  obuf[OUTBUFLEN];
   xadUINT32 obufp;
+
+  /* When set, decompression counts output bytes instead of writing them.
+   * Used by GetInfo to determine the uncompressed file size. */
+  xadBOOL   count_only;
+  xadSize   out_count;
 
   /* LZW tables */
   LZWSTRING lzwstrtab[TABSIZE];
@@ -156,8 +164,106 @@ static xadINT32 cvb(xadUINT8 dec) {
   return ((dec >> 4) * 10) + (dec & 0x0f);
 }
 
+/* Validate the 30-byte base header that follows the 8-byte ID. */
+static xadBOOL vmarc_header_valid(const xadUINT8 *buf) {
+  xadUINT8 flags = buf[H_FLAGS];
+  xadUINT8 recfm = (xadUINT8)e2a_tab[buf[H_RECFM]];
+  xadINT32 month, day, hour, minute, second;
+  int i;
+
+  if (buf[H_VER] != 1 || buf[H_REL] > 2) return XADFALSE;
+  if (flags & ~(HF_S2 | HF_ASIS | HF_Y2K | HF_EXTH)) return XADFALSE;
+  if (recfm != 'F' && recfm != 'V') return XADFALSE;
+
+  /* FN and FT are eight printable EBCDIC characters, space padded. */
+  for (i = 0; i < 8; i++) {
+    xadUINT8 c = e2a_tab[buf[H_FN + i]];
+    if (c < ' ' || c > '~') return XADFALSE;
+    c = e2a_tab[buf[H_FT + i]];
+    if (c < ' ' || c > '~') return XADFALSE;
+  }
+
+  /* File mode is one letter followed by one digit. */
+  if (!isalpha(e2a_tab[buf[H_FM]]) || !isdigit(e2a_tab[buf[H_FM + 1]])) {
+    return XADFALSE;
+  }
+
+  month = cvb(buf[H_MONTH]);
+  day = cvb(buf[H_DAY]);
+  hour = cvb(buf[H_HOUR]);
+  minute = cvb(buf[H_MINUTE]);
+  second = cvb(buf[H_SECOND]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return XADFALSE;
+  if (hour > 23 || minute > 59 || second > 59) return XADFALSE;
+
+  return XADTRUE;
+}
+
+/* Read and fully validate a candidate header at an absolute archive offset. */
+static xadBOOL vmarc_read_header(struct xadArchiveInfo *ai,
+                                 struct xadMasterBase *xadMasterBase,
+                                 xadSize pos, xadUINT8 *hdr)
+{
+  xadSize saved = ai->xai_InPos;
+  xadBOOL found = XADFALSE;
+
+  if (pos + 38 > ai->xai_InSize) return XADFALSE;
+
+  ai->xai_InPos = pos;
+  if (xadHookAccess(XADM XADAC_READ, 38, hdr, ai) == XADERR_OK &&
+      memcmp(hdr, vmarc_hid, 8) == 0 &&
+      vmarc_header_valid(hdr + 8)) {
+    found = XADTRUE;
+  }
+  ai->xai_InPos = saved;
+  return found;
+}
+
+/* Find the next valid subfile header, scanning byte by byte like the
+ * reference VMARC tools do. On success hdr holds ID + base header. */
+static xadBOOL vmarc_find_header(struct xadArchiveInfo *ai,
+                                 struct xadMasterBase *xadMasterBase,
+                                 xadSize from, xadSize *pos, xadUINT8 *hdr)
+{
+  xadSize saved = ai->xai_InPos;
+  xadSize p = from;
+  int ndx = 0;
+
+  while (p < ai->xai_InSize) {
+    xadUINT8 b;
+    ai->xai_InPos = p;
+    if (xadHookAccess(XADM XADAC_READ, 1, &b, ai) != XADERR_OK) {
+      ai->xai_InPos = saved;
+      return XADFALSE;
+    }
+
+    if (b == vmarc_hid[ndx]) {
+      ndx++;
+    } else if (b == vmarc_hid[0]) {
+      ndx = 1;
+    } else {
+      ndx = 0;
+    }
+
+    if (ndx == 8) {
+      xadSize candidate = p - 7;
+      if (vmarc_read_header(ai, xadMasterBase, candidate, hdr)) {
+        ai->xai_InPos = saved;
+        *pos = candidate;
+        return XADTRUE;
+      }
+      ndx = 0;
+    }
+    p++;
+  }
+
+  ai->xai_InPos = saved;
+  return XADFALSE;
+}
+
 /* Flush output buffer */
 static xadERROR flush_output(struct VMARCState *s) {
+  if (s->count_only) return XADERR_OK;
   if (s->obufp > 0) {
     struct xadMasterBase *xadMasterBase = s->xmb;
     xadERROR err = xadHookAccess(XADM XADAC_WRITE, s->obufp, s->obuf, s->ai);
@@ -169,6 +275,10 @@ static xadERROR flush_output(struct VMARCState *s) {
 
 /* Put single byte to output stream buffer */
 static xadBOOL put_out_byte(struct VMARCState *s, xadUINT8 b) {
+  if (s->count_only) {
+    s->out_count++;
+    return XADTRUE;
+  }
   s->obuf[s->obufp++] = b;
   if (s->obufp >= OUTBUFLEN) {
     if (flush_output(s) != XADERR_OK) {
@@ -182,19 +292,22 @@ static xadBOOL put_out_byte(struct VMARCState *s, xadUINT8 b) {
 static xadINT32 get_input_byte(struct VMARCState *s) {
   if (s->icnt == 0) {
     struct xadMasterBase *xadMasterBase = s->xmb;
-    xadSize remain = (s->ai->xai_InSize > s->ai->xai_InPos) ? (s->ai->xai_InSize - s->ai->xai_InPos) : 0;
+    xadSize upper = s->limit;
+    xadSize remain = (upper > s->ai->xai_InPos) ? (upper - s->ai->xai_InPos) : 0;
     xadUINT32 toread = (remain > BUFLEN) ? BUFLEN : (xadUINT32)remain;
     if (toread == 0) {
       return -1;
     }
     s->ipos = s->ai->xai_InPos;
     if (xadHookAccess(XADM XADAC_READ, toread, s->ibuf, s->ai) != XADERR_OK) {
+      s->input_error = XADTRUE;
       return -1;
     }
     s->icnt = toread;
     s->ibufp = 0;
   }
   s->icnt--;
+  s->in_count++;
   return s->ibuf[s->ibufp++];
 }
 
@@ -337,7 +450,9 @@ static xadERROR decompress_lzw(struct VMARCState *s) {
 
   while (1) {
     code = get_code12(s);
-    if (code == 0xffff) return XADERR_ILLEGALDATA;
+    if (code == 0xffff) {
+      return s->input_error ? XADERR_INPUT : XADERR_ILLEGALDATA;
+    }
 
     ent = &s->lzwstrtab[code];
     if (ent->pred == NULL) return XADERR_ILLEGALDATA;
@@ -395,7 +510,6 @@ static void s2_addnew(struct VMARCState *s, xadUINT16 slastcode, xadUINT16 lastc
   STRDSECT *probe;
   STRDSECT *ostr;
   STRDSECT **psib;
-  STRDSECT **opsib;
 
   if ((left->strlen + right->strlen) > (TABSIZE - 2)) return;
 
@@ -434,15 +548,15 @@ static void s2_addnew(struct VMARCState *s, xadUINT16 slastcode, xadUINT16 lastc
   probe->strright = right;
   probe->strlen = 2 + left->strlen + right->strlen;
 
+  /* Walk the sibling list to its end without ever forming a pointer
+   * from a NULL node (which would be undefined behaviour). */
   psib = &left->stroffsp;
-  do {
-    opsib = psib;
-    left = *psib;
-    psib = &left->strsiblg;
-  } while (left && (left != s->s2tabp));
+  while (*psib && *psib != s->s2tabp) {
+    psib = &(*psib)->strsiblg;
+  }
 
-  probe->strsiblg = left;
-  *opsib = probe;
+  probe->strsiblg = *psib;
+  *psib = probe;
   s->s2tabp = probe;
 }
 
@@ -471,7 +585,9 @@ static xadERROR decompress_s2(struct VMARCState *s) {
   s2_init(s);
 
   slastcode = get_code12(s);
-  if (slastcode == 0xffff) return XADERR_ILLEGALDATA;
+  if (slastcode == 0xffff) {
+    return s->input_error ? XADERR_INPUT : XADERR_ILLEGALDATA;
+  }
 
   rc = put_decoded_byte(s, slastcode);
   if (rc < 0) return XADERR_OUTPUT;
@@ -479,7 +595,9 @@ static xadERROR decompress_s2(struct VMARCState *s) {
 
   while (1) {
     lastcode = get_code12(s);
-    if (lastcode == 0xffff) return XADERR_ILLEGALDATA;
+    if (lastcode == 0xffff) {
+      return s->input_error ? XADERR_INPUT : XADERR_ILLEGALDATA;
+    }
 
     curr = &s->s2strtab[lastcode];
     prev = NULL;
@@ -532,16 +650,22 @@ static xadERROR decompress_asis(struct VMARCState *s) {
 
   while (1) {
     h = get_input_byte(s);
-    if (h < 0) break;
+    if (h < 0) {
+      return s->input_error ? XADERR_INPUT : XADERR_OK;
+    }
     l = get_input_byte(s);
-    if (l < 0) return XADERR_ILLEGALDATA;
+    if (l < 0) {
+      return s->input_error ? XADERR_INPUT : XADERR_ILLEGALDATA;
+    }
 
     lrecl = (h << 8) | l;
     if (lrecl == 0) break;
 
     while (lrecl-- > 0) {
       l = get_input_byte(s);
-      if (l < 0) return XADERR_ILLEGALDATA;
+      if (l < 0) {
+        return s->input_error ? XADERR_INPUT : XADERR_ILLEGALDATA;
+      }
       if (put_decoded_byte(s, (xadUINT16)(l + kodebcd)) < 0) {
         return XADERR_OUTPUT;
       }
@@ -560,12 +684,63 @@ static xadERROR decompress_asis(struct VMARCState *s) {
   return XADERR_OK;
 }
 
+/* Measure the bytes produced by a decompressor without writing them.
+ * The VMARC header does not store the uncompressed size, so this is the
+ * only way to fill in xfi_Size accurately. */
+static void vmarc_measure_size(struct xadArchiveInfo *ai,
+                               struct xadMasterBase *xadMasterBase,
+                               struct xadFileInfo *fi, xadUINT8 flags,
+                               xadUINT8 recfm, xadUINT32 lrecl)
+{
+  struct VMARCState *s = (struct VMARCState *)xadAllocVec(
+    XADM sizeof(struct VMARCState), XADMEMF_CLEAR);
+  xadSize saved_pos = ai->xai_InPos;
+  xadERROR err;
+
+  if (!s) {
+    fi->xfi_Size = 0;
+    fi->xfi_Flags |= XADFIF_NOUNCRUNCHSIZE;
+    return;
+  }
+
+  s->ai = ai;
+  s->xmb = xadMasterBase;
+  s->recfm = recfm;
+  s->lrecl = lrecl;
+  s->is_text = 1;
+  s->residual = 0xffffffff;
+  s->count_only = XADTRUE;
+  s->limit = fi->xfi_DataPos + fi->xfi_CrunchSize;
+  if (s->limit > ai->xai_InSize) s->limit = ai->xai_InSize;
+
+  ai->xai_InPos = fi->xfi_DataPos;
+  if (flags & HF_ASIS) {
+    err = decompress_asis(s);
+  } else if (flags & HF_S2) {
+    err = decompress_s2(s);
+  } else {
+    err = decompress_lzw(s);
+  }
+  ai->xai_InPos = saved_pos;
+
+  if (err == XADERR_OK) {
+    fi->xfi_CrunchSize = s->in_count;
+    fi->xfi_Size = s->out_count;
+  } else {
+    /* Leave the size unknown rather than reporting a bogus value. */
+    fi->xfi_Size = 0;
+    fi->xfi_Flags |= XADFIF_NOUNCRUNCHSIZE;
+  }
+  xadFreeObjectA(XADM s, NULL);
+}
+
 /* --------------------------------------------------------------------
  * XAD Client Callbacks
  * -------------------------------------------------------------------- */
 
 XADRECOGDATA(VMARC)
 {
+  (void)xadMasterBase;
   if (size >= 8 && memcmp(data, vmarc_hid, 8) == 0) {
     return 1;
   }
@@ -580,60 +755,32 @@ XADGETINFO(VMARC)
   struct xadFileInfo *lastfi = NULL;
 
   while (ai->xai_InPos < ai->xai_InSize) {
-    xadSize startpos = ai->xai_InPos;
+    xadSize startpos;
 
-    /* Align to 80-byte record if needed */
-    if (startpos % 80 != 0) {
-      xadSize skip = 80 - (startpos % 80);
-      if (xadHookAccess(XADM XADAC_INPUTSEEK, skip, NULL, ai) != XADERR_OK) {
-        break;
-      }
-      startpos = ai->xai_InPos;
-    }
-
-    /* Read header identifier (8 bytes) */
-    if (xadHookAccess(XADM XADAC_READ, 8, buf, ai) != XADERR_OK) {
+    if (!vmarc_find_header(ai, xadMasterBase, ai->xai_InPos, &startpos, buf)) {
+      err = XADERR_ILLEGALDATA;
       break;
     }
 
-    if (memcmp(buf, vmarc_hid, 8) != 0) {
-      /* Search remaining 80-byte boundaries */
-      xadINT32 found = 0;
-      while (ai->xai_InPos + 8 <= ai->xai_InSize) {
-        if (xadHookAccess(XADM XADAC_INPUTSEEK, 72, NULL, ai) != XADERR_OK) break;
-        if (xadHookAccess(XADM XADAC_READ, 8, buf, ai) != XADERR_OK) break;
-        if (memcmp(buf, vmarc_hid, 8) == 0) {
-          found = 1;
-          break;
-        }
-      }
-      if (!found) break;
-    }
-
-    /* Read base header (30 bytes) */
-    if (xadHookAccess(XADM XADAC_READ, H_DLEN, buf, ai) != XADERR_OK) {
-      break;
-    }
-
-    /* Validate header version */
-    if (buf[H_VER] != 1 || buf[H_REL] > 2) {
-      break;
-    }
+    /* The finder returns ID + base header; keep the base header in buf. */
+    memmove(buf, buf + 8, H_DLEN);
+    ai->xai_InPos = startpos + 38;
 
     xadUINT8 flags = buf[H_FLAGS];
-    xadUINT8 recfm = e2a_tab[buf[H_RECFM]];
-    if (recfm != 'F' && recfm != 'V') {
-      break;
-    }
+    xadUINT8 recfm = (xadUINT8)e2a_tab[buf[H_RECFM]];
 
-    xadUINT16 lrecl = ((xadUINT16)buf[H_LRECL] << 8) | buf[H_LRECL + 1];
+    xadUINT32 lrecl = ((xadUINT32)buf[H_LRECL] << 8) | buf[H_LRECL + 1];
 
-    /* Extended header check */
+    /* Extended header: bytes 30..33 hold the full 32-bit LRECL. The
+     * 2-byte field in the basic header is only a truncated copy. */
     if (flags & HF_EXTH) {
       xadUINT8 exth[12];
       if (xadHookAccess(XADM XADAC_READ, 12, exth, ai) != XADERR_OK) {
+        err = XADERR_INPUT;
         break;
       }
+      lrecl = ((xadUINT32)exth[0] << 24) | ((xadUINT32)exth[1] << 16) |
+              ((xadUINT32)exth[2] << 8) | (xadUINT32)exth[3];
     }
 
     xadSize data_start = ai->xai_InPos;
@@ -690,9 +837,11 @@ XADGETINFO(VMARC)
     fi->xfi_DataPos = data_start;
     fi->xfi_Flags = XADFIF_SEEKDATAPOS;
 
-    /* Date and time decoding from BCD */
+    /* Date and time decoding from BCD. Very old VMARC writers did not
+     * set HF_Y2K, so a year below 1960 belongs to the 21st century. */
     xadINT32 year = cvb(buf[H_YEAR]) + 1900;
     if (flags & HF_Y2K) year += 100;
+    if (year < 1960) year += 100;
     fi->xfi_Date.xd_Year   = year;
     fi->xfi_Date.xd_Month  = cvb(buf[H_MONTH]);
     fi->xfi_Date.xd_Day    = cvb(buf[H_DAY]);
@@ -709,28 +858,14 @@ XADGETINFO(VMARC)
       pf->vpf_DataPos = data_start;
     }
 
-    /* Fast-forward to next subfile header:
-     * In VMARC archives, every subfile header is aligned on an 80-byte card boundary.
-     * We align to the next 80-byte boundary and inspect 8-byte blocks at each 80-byte boundary.
-     */
+    /* Find the next fully valid subfile header. Byte-wise scanning is used
+     * so archives that were not reblocked to 80-column cards still work. */
     xadSize next_header_pos = ai->xai_InSize;
-    xadUINT8 scan_buf[10];
-
-    xadSize scan_pos = (data_start + 79) / 80 * 80;
-    while (scan_pos + 80 <= ai->xai_InSize) {
-      ai->xai_InPos = scan_pos;
-      if (xadHookAccess(XADM XADAC_READ, 10, scan_buf, ai) != XADERR_OK) {
-        break;
-      }
-      if (memcmp(scan_buf, vmarc_hid, 8) == 0 && scan_buf[8] == 1 && scan_buf[9] <= 2) {
-        next_header_pos = scan_pos;
-        break;
-      }
-      scan_pos += 80;
-    }
+    xadUINT8 scan_buf[38];
+    (void)vmarc_find_header(ai, xadMasterBase, data_start, &next_header_pos, scan_buf);
 
     fi->xfi_CrunchSize = (next_header_pos > data_start) ? (next_header_pos - data_start) : 0;
-    fi->xfi_Size = fi->xfi_CrunchSize;
+    vmarc_measure_size(ai, xadMasterBase, fi, flags, recfm, lrecl);
 
     if (lastfi) {
       lastfi->xfi_Next = fi;
@@ -760,12 +895,15 @@ XADUNARCHIVE(VMARC)
   struct VMARCState *s = (struct VMARCState *)xadAllocVec(XADM sizeof(struct VMARCState), XADMEMF_CLEAR);
   if (!s) return XADERR_NOMEMORY;
 
+  ai->xai_InPos = pf->vpf_DataPos;
+
   s->ai = ai;
   s->xmb = xadMasterBase;
   s->recfm = pf->vpf_Recfm;
   s->lrecl = pf->vpf_Lrecl;
   s->is_text = 1; /* Text converted to ISO-8859-1 (Latin-1) */
   s->residual = 0xffffffff;
+  s->limit = ai->xai_InSize;
 
   xadERROR err = XADERR_OK;
 
@@ -787,6 +925,7 @@ XADUNARCHIVE(VMARC)
 
 XADFREE(VMARC)
 {
+  (void)xadMasterBase;
   /* All xadFileInfo and PrivateInfo allocated through XAD are freed by xadmaster */
   ai->xai_PrivateClient = NULL;
 }

@@ -321,6 +321,8 @@ int main(void) {
     assert(fi1->xfi_Date.xd_Hour == 14);
     assert(fi1->xfi_Date.xd_Minute == 30);
     assert(fi1->xfi_Date.xd_Second == 45);
+    assert(fi1->xfi_Size == 64);
+    assert(fi1->xfi_CrunchSize > 0);
 
     ai.xai_CurFile = fi1;
     ai.xai_InPos = fi1->xfi_DataPos;
@@ -338,6 +340,7 @@ int main(void) {
     assert(fi2 != NULL);
     assert(fi2->xfi_EntryNumber == 2);
     assert(strcmp(fi2->xfi_FileName, "SAMPLE.TEXT.B2") == 0);
+    assert(fi2->xfi_Size == 122);
 
     ai.xai_CurFile = fi2;
     ai.xai_InPos = fi2->xfi_DataPos;
@@ -384,6 +387,7 @@ int main(void) {
     assert(err == XADERR_OK);
     assert(ai.xai_FileInfo != NULL);
     assert(strcmp(ai.xai_FileInfo->xfi_FileName, "LZWTEST.FILE.A1") == 0);
+    assert(ai.xai_FileInfo->xfi_Size == 35);
 
     ai.xai_CurFile = ai.xai_FileInfo;
     ai.xai_InPos = ai.xai_FileInfo->xfi_DataPos;
@@ -429,6 +433,7 @@ int main(void) {
     assert(err == XADERR_OK);
     assert(ai.xai_FileInfo != NULL);
     assert(strcmp(ai.xai_FileInfo->xfi_FileName, "S2TEST.C.M1") == 0);
+    assert(ai.xai_FileInfo->xfi_Size == 34);
 
     ai.xai_CurFile = ai.xai_FileInfo;
     ai.xai_InPos = ai.xai_FileInfo->xfi_DataPos;
