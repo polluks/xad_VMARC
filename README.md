@@ -5,7 +5,7 @@ It is compatible with `xadmaster.library` / `libxad` across MorphOS, AmigaOS, an
 
 ## Features
 - **VMARC Recognition (`VMARC_RecogData`)**:
-  - Validates the standard 8-byte EBCDIC `:CFF    ` signature on 80-byte card record boundaries.
+  - Locates and validates the standard 8-byte EBCDIC `:CFF    ` signature.
 - **Archive Cataloging (`VMARC_GetInfo`)**:
   - Parses VMARC subfile headers (Version 1, Releases 0–2).
   - Normalizes CMS filenames to uppercase `FN.FT.FM` format (e.g., `MYPROG.EXEC.A1`).
@@ -28,6 +28,17 @@ It is compatible with `xadmaster.library` / `libxad` across MorphOS, AmigaOS, an
 To compile and execute the test suite:
 ```sh
 make test
+```
+
+### Compiling with vbcc
+Requires an Amiga/68k-capable vbcc installation:
+```sh
+make vbcc
+```
+
+For MorphOS, override the flags:
+```sh
+make vbcc VBCCFLAGS="-O2 -I. -Iinclude -D__MORPHOS__ -DSDI_MORPHOSNOREG"
 ```
 
 ### Compiling for MorphOS

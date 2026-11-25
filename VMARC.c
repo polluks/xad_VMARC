@@ -372,7 +372,7 @@ static xadINT32 put_decoded_byte(struct VMARCState *s, xadUINT16 c) {
 
 /* LZW Support Functions */
 static void lzw_lookup(struct VMARCState *s, LZWSTRING *lastpred, xadUINT16 nextchar, LZWSTRING **ent) {
-  xadUINT32 key = (xadUINT32)(((uintptr_t)lastpred << 6) ^ nextchar) % HASHSIZE;
+  xadUINT32 key = (xadUINT32)((((unsigned long)lastpred) << 6) ^ nextchar) % HASHSIZE;
   LZWHASH *hash = &s->lzwhashtab[key];
   LZWSTRING *origin = (LZWSTRING *)hash;
   LZWSTRING *probe;
